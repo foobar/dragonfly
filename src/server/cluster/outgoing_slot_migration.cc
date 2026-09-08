@@ -14,6 +14,7 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
+#include "server/journal/journal.h"
 #include "server/journal/streamer.h"
 #include "server/main_service.h"
 #include "server/namespaces.h"
@@ -36,6 +37,7 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
   SliceSlotMigration(DbSlice* slice, ServerContext server_context, SlotSet slots,
                      OutgoingMigration* om)
       : ProtocolClient(server_context), streamer_(slice, std::move(slots), &exec_st_) {
+    journal::AcquireUser();
     // Flows only report errors; teardown is owned by the migration-level handler
     // (OutgoingMigration::OnAttemptError), which ResetError() joins at every attempt boundary.
     // A forwarder that fires late (after the boundary) injects an error into the new attempt
@@ -51,6 +53,8 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
     LOG_IF(DFATAL, unregistered)
         << "Streamer was not unregistered properly. Check code for race conditions.";
     exec_st_.JoinErrorHandler();
+    if (journal_held_)
+      journal::ReleaseUser();
   }
 
   // Send DFLYMIGRATE FLOW
@@ -94,9 +98,14 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
   }
 
   void Cancel() {
+    ++cancels_in_progress_;
     // Shutdown socket and allow IO loops to return.
     ShutdownSocket();
     streamer_.Cancel();
+    if (--cancels_in_progress_ == 0 && journal_held_) {
+      journal::ReleaseUser();
+      journal_held_ = false;
+    }
   }
 
   void Finalize(long attempt) {
@@ -112,6 +121,8 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
  private:
   ExecutionState exec_st_;
   RestoreStreamer streamer_;
+  bool journal_held_ = true;
+  uint32_t cancels_in_progress_ = 0;
 };
 
 OutgoingMigration::OutgoingMigration(MigrationInfo info, ClusterFamily* cf, ServerFamily* sf)
@@ -307,7 +318,6 @@ void OutgoingMigration::SyncFb() {
         migration->Cancel();
       }
       DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
-      journal::StartInThread();
       migration = std::make_unique<SliceSlotMigration>(&db_slice, server(),
                                                        migration_info_.slot_ranges, this);
     });

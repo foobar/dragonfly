@@ -56,6 +56,25 @@ error_code Close() {
   return {};
 }
 
+void AcquireUser(bool start_journal) {
+  if (start_journal) {
+    StartInThread();
+  }
+  journal_slice.AcquireUser();
+}
+
+void ReleaseUser() {
+  journal_slice.ReleaseUser();
+}
+
+void MaybeStop() {
+  EngineShard* shard = EngineShard::tlocal();
+  if (shard->journal() && journal_slice.CanStop()) {
+    ClearBuffer();
+    shard->set_journal(false);
+  }
+}
+
 unsigned GetCallbackCount() {
   return journal_slice.OnChangeCbCount();
 }
